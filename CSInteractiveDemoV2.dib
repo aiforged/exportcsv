@@ -1,0 +1,298 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"name":"csharp","languageName":"C#","aliases":["c#","C#"]},{"name":"vscode","aliases":["frontend"],"languageName":null},{"name":"javascript","languageName":"JavaScript","aliases":["js"]},{"name":"webview","aliases":[]},{"name":".NET","aliases":[]}]}}
+
+#!markdown
+
+First load all the required packages
+
+#!csharp
+
+//Always use the latest version
+#r "nuget: LarcAI.Core"
+#r "nuget: AIForged.SDK"
+
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using System.Text.Json;
+
+using AIForged;
+using AIForged.API;
+
+#!markdown
+
+Fill in with your details and project details
+
+You can get this from AIForged Studio
+
+#!csharp
+
+string userName = "";
+string passWord = "";
+string displayName = "";
+
+int? projectId = null;
+int? serviceId = null;
+
+//Filter documents by date
+DateTime? fromDate = new DateTime(2023, 1, 1);
+DateTime? toDate = DateTime.UtcNow;
+
+//Separator to use in CSV text
+string csvSeparator = ";";
+
+#!csharp
+
+//Setup our API config with login credentials
+"Logging in...".Display();
+var cfg = new AIForged.API.Config("https://portal.aiforged.com", userName, passWord, displayName);
+await cfg.Init(allowAutoRedirect: true);
+var ctx = new AIForged.API.Context(cfg);
+
+//Login with our API context
+var user = await ctx.LoginAsync();
+
+if (user == null) 
+{
+    "Login failed...".Display();
+    return;
+}
+
+"Getting project by Id...".Display();
+//Get project details via the project Id
+var project = await ctx.GetProjectAsync(user.Id, projectId);
+$"Found project: {project.Name}".Display();
+
+"Getting service by Id...".Display();
+//Get AI service details via the service Id
+var service = await ctx.GetServiceAsync(serviceId);
+$"Found service: {service.Name}".Display();
+//Get project document categories / classes
+var classes = await ctx.GetClassesAsync(project.Id);
+
+//Get only result parameter definitions
+var paramDefsResult = await ctx.ServicesClient.GetCustomTrainingFieldsAsync(user.Id, projectId, serviceId, null);
+var paramDefs = paramDefsResult.Result?.Where(p => p.Availability == Availability.Training).ToList();
+var tableParamDefs = paramDefs.Where(p => p.Grouping == GroupingType.Table).ToList();
+
+paramDefs = paramDefs.Where(p => p.Grouping != GroupingType.Table &&
+    p.Grouping != GroupingType.Word && 
+    p.Grouping != GroupingType.Line && 
+    p.Grouping != GroupingType.Column && 
+    p.Grouping != GroupingType.Row)
+    .OrderBy(p => p.Index)
+    .ThenBy(p => p.DisplayName)
+    .ToList();
+
+
+"Getting docs to export".Display();
+//Get processed documents that are in our service's outbox.
+//Here we filter by documents with both Processed and Verification Statuses
+var docsresp = await ctx.DocumentClient.GetExtendedAsync(user.Id, project.Id, service.Id, UsageType.Outbox, new List<DocumentStatus> { DocumentStatus.Processed, DocumentStatus.Verification }, 
+    null, null, null, fromDate, toDate, null, null, null, null, null, null, null, null, null, null, null, null, null);
+$"Found {docsresp.Result.Count} docs".Display();
+
+"Building results datatable".Display();
+//Create a simple data table to store our expense results for each document
+DataTable exportResults = new DataTable();
+Dictionary<int?, DataTable> tableExportResults = new Dictionary<int?, DataTable>();
+
+if (tableParamDefs.Count == 0)
+{
+    foreach (var paramDef in paramDefs)
+    {
+        try
+        {
+            exportResults.Columns.Add(new DataColumn(paramDef.DisplayName));
+        }
+        catch 
+        {
+            $"Could not add column {paramDef.DisplayName}".Display();
+            //Ignore if column exists
+        }
+    }
+    $"Results table has {exportResults.Columns.Count} columns".Display();
+}
+else
+{
+    foreach (var table in tableParamDefs)
+    {
+        DataTable tableResults = new DataTable();
+
+        tableResults.Columns.Add(new DataColumn("DocId"));
+        tableResults.Columns.Add(new DataColumn("FileName"));
+        tableResults.Columns.Add(new DataColumn("Table"));
+        tableResults.Columns.Add(new DataColumn("Index"));
+
+        foreach (var col in table.Children.Where(p => p.Grouping == GroupingType.Column)
+            .OrderBy(p => p.Index)
+            .ThenBy(p => p.DisplayName))
+        {
+            tableResults.Columns.Add(new DataColumn(col.DisplayName));
+        }
+
+        foreach (var paramDef in paramDefs)
+        {
+            try
+            {
+                tableResults.Columns.Add(new DataColumn(paramDef.DisplayName));
+            }
+            catch 
+            {
+                $"Could not add column {paramDef.DisplayName}".Display();
+                //Ignore if column exists
+            }
+        }
+
+        tableExportResults.Add(table.Id, tableResults);
+    }
+
+    $"Results table has {exportResults.Columns.Count} columns".Display();
+}
+
+"Done".Display();
+
+#!csharp
+
+"Gathering extraction results...".Display();
+//Reset our exportResults so that we can run this cell without needing to run the previous cell
+exportResults.Rows.Clear();
+
+//Iterate through each document in our docresp.Result and retrieve it's extraction results
+if (tableParamDefs.Count == 0)
+{
+    //Reset without needing to rerun the previous cell
+    exportResults.Rows.Clear();
+    foreach (var doc in docsresp.Result)
+    {
+        //Retrieve extraction results by passing in the document Id
+        var extractresp = await ctx.ParametersClient.ExtractAsync(doc.Id);
+        var results = extractresp.Result.ToList();
+        
+        //Populate exportResults with our extracted results
+        int colCount = 0;
+        var dataRow = exportResults.NewRow();
+
+        foreach (var paramDef in paramDefs)
+        {
+            if (!exportResults.Columns.Contains(paramDef.DisplayName)) continue;
+            dataRow[paramDef.DisplayName] = results.FirstOrDefault(r => r.Id == paramDef.Id)?.Value?.ToString();
+            colCount++;
+        }
+        exportResults.Rows.Add(dataRow);
+    }
+}
+else
+{
+    foreach (var doc in docsresp.Result)
+    {
+        var extractresp = await ctx.ParametersClient.ExtractAsync(doc.Id);
+        var results = extractresp.Result.ToList();
+        foreach (var table in tableParamDefs)
+        {
+            var resultsTable = results.FirstOrDefault(r => r.Id == table.Id);
+
+            if (resultsTable == null) continue;
+            var tableResults = tableExportResults[table.Id];
+            int totalRows = table.Children.Max(col => results.Count(r => r.Id == col.Id));
+
+            //Reset without needing to rerun the previous cell
+            tableResults.Rows.Clear();
+            for (int i = 0; i < totalRows; i++)
+            {
+                var dataRow = tableResults.NewRow();
+
+                dataRow["DocId"] = doc.Id;
+                dataRow["FileName"] = doc.Filename;
+                dataRow["Table"] = table.DisplayName;
+                dataRow["Index"] = i;
+
+                foreach (var col in table.Children.Where(p => p.Grouping == GroupingType.Column))
+                {   
+                    if (!tableResults.Columns.Contains(col.DisplayName)) continue;
+                    dataRow[col.DisplayName] = results.FirstOrDefault(r => r.Id == col.Id && r.ParamIndex == i)?.Value.Replace("\r", string.Empty).Replace("\n", string.Empty);
+                }
+
+                foreach (var paramDef in paramDefs)
+                {
+                    if (!tableResults.Columns.Contains(paramDef.DisplayName)) continue;
+                    dataRow[paramDef.DisplayName] = results.FirstOrDefault(r => r.Id == paramDef.Id)?.Value?.ToString();
+                }
+                tableResults.Rows.Add(dataRow);
+            }
+            tableExportResults[table.Id] = tableResults;
+        }
+    }
+}
+
+
+"Building csv list...".Display();
+//Create our 'Export CSV List'
+List<string> exportCSV = new List<string>();
+
+//Populate our Export CSV List with our extracted results
+if (tableParamDefs.Count == 0)
+{
+    //Append the row headers to the first line in the CSV
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < exportResults.Columns.Count; i++)
+    {
+        sb.Append(exportResults.Columns[i].ToString());
+        if (i < exportResults.Columns.Count - 1)
+        {
+            sb.Append(csvSeparator);
+        }
+    }
+    exportCSV.Add(sb.ToString());
+    foreach (DataRow row in exportResults.Rows)
+    {
+        sb = new StringBuilder();
+        for (int i = 0; i < exportResults.Columns.Count; i++)
+        {
+            sb.Append(row[i].ToString());
+            if (i < exportResults.Columns.Count - 1)
+            {
+                sb.Append(csvSeparator);
+            }
+        }
+        exportCSV.Add(sb.ToString());
+    }
+}
+else
+{
+    foreach (var resultsTable in tableExportResults.Values)
+    {
+        //Append the row headers to the first line in the CSV
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < resultsTable.Columns.Count; i++)
+        {
+            sb.Append(resultsTable.Columns[i].ToString());
+            if (i < resultsTable.Columns.Count - 1)
+            {
+                sb.Append(csvSeparator);
+            }
+        }
+        exportCSV.Add(sb.ToString());
+        foreach (DataRow row in resultsTable.Rows)
+        {
+            sb = new StringBuilder();
+            for (int i = 0; i < resultsTable.Columns.Count; i++)
+            {
+                sb.Append(row[i].ToString());
+                if (i < resultsTable.Columns.Count - 1)
+                {
+                    sb.Append(csvSeparator);
+                }
+            }
+            exportCSV.Add(sb.ToString());
+        }
+    }
+}
+
+foreach (var e in exportCSV)
+{
+    Console.WriteLine(e);
+}
+"Done".Display();
